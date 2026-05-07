@@ -6,11 +6,10 @@ A Socratic teaching assistant that can reference your own documents.
 
 Features:
 - Socratic teaching method
-- RAG: indexes your docs for context-aware responses
+- RAG: indexes your docs (including PDFs) for context-aware responses
 - Code snippet management
 
 Usage: python tutor.py
-
 Place documents in the 'docs/' folder to enable RAG.
 """
 
@@ -20,8 +19,16 @@ import tempfile
 import subprocess
 from pathlib import Path
 from typing import List, Optional
+
 from dotenv import load_dotenv
 from openai import OpenAI
+
+# PDF support is optional - the tutor still works for text/code files without it
+try:
+    from pypdf import PdfReader
+    PDF_SUPPORT = True
+except ImportError:
+    PDF_SUPPORT = False
 
 # Load environment variables
 load_dotenv()
@@ -29,10 +36,16 @@ load_dotenv()
 # ============================================================================
 # RAG CONFIGURATION
 # ============================================================================
-DOCS_FOLDER = Path("docs")  # Place your reference documents here
-CHUNK_SIZE = 500  # Characters per chunk
-CHUNK_OVERLAP = 50  # Overlap between chunks
-TOP_K_RESULTS = 3  # Number of relevant chunks to retrieve
+DOCS_FOLDER = Path("docs")          # Place your reference documents here
+CHUNK_SIZE = 500                    # Characters per chunk
+CHUNK_OVERLAP = 50                  # Overlap between chunks
+TOP_K_RESULTS = 3                   # Number of relevant chunks to retrieve
+
+# File types we know how to read. Text-like files are read directly;
+# PDFs are routed through pypdf.
+TEXT_EXTENSIONS = {".txt", ".md", ".py", ".js", ".java",
+                   ".cpp", ".c", ".html", ".css"}
+PDF_EXTENSIONS = {".pdf"}
 
 # ============================================================================
 # SYSTEM PROMPT - Enforces Socratic Teaching Behavior
@@ -88,6 +101,66 @@ Remember: Your success is measured by how much the STUDENT learns and figures ou
 
 
 # ============================================================================
+# FILE READERS
+# ============================================================================
+def read_text_file(path: Path) -> str:
+    """Read a plain text or source code file."""
+    return path.read_text(encoding="utf-8", errors="ignore")
+
+
+def read_pdf_file(path: Path) -> str:
+    """
+    Extract text from a PDF, page by page.
+
+    Returns an empty string if pypdf isn't installed or extraction fails.
+    Page boundaries are preserved as blank lines so the chunker can still
+    align roughly with logical breaks.
+    """
+    if not PDF_SUPPORT:
+        print(f"  [!] Skipping {path.name}: pypdf not installed. "
+              f"Run: pip install pypdf")
+        return ""
+
+    try:
+        reader = PdfReader(str(path))
+        if reader.is_encrypted:
+            # Try empty password first - many PDFs are "encrypted" but unlocked
+            try:
+                reader.decrypt("")
+            except Exception:
+                print(f"  [!] Skipping {path.name}: encrypted PDF")
+                return ""
+
+        pages = []
+        for page in reader.pages:
+            try:
+                text = page.extract_text() or ""
+            except Exception:
+                text = ""
+            if text.strip():
+                pages.append(text)
+
+        return "\n\n".join(pages)
+
+    except Exception as e:
+        print(f"  [!] Could not read {path.name}: {e}")
+        return ""
+
+
+def read_document(path: Path) -> str:
+    """
+    Dispatch to the right reader based on file extension.
+    Returns an empty string for unsupported types or read failures.
+    """
+    suffix = path.suffix.lower()
+    if suffix in TEXT_EXTENSIONS:
+        return read_text_file(path)
+    if suffix in PDF_EXTENSIONS:
+        return read_pdf_file(path)
+    return ""
+
+
+# ============================================================================
 # SIMPLE RAG IMPLEMENTATION (No external vector DB required)
 # ============================================================================
 class SimpleRAG:
@@ -98,7 +171,7 @@ class SimpleRAG:
 
     def __init__(self, client: OpenAI):
         self.client = client
-        self.documents: List[dict] = []  # List of {text, embedding, source}
+        self.documents: List[dict] = []   # List of {text, embedding, source}
         self.is_indexed = False
 
     def chunk_text(self, text: str, source: str) -> List[dict]:
@@ -108,7 +181,7 @@ class SimpleRAG:
         while start < len(text):
             end = start + CHUNK_SIZE
             chunk = text[start:end]
-            if chunk.strip():  # Only add non-empty chunks
+            if chunk.strip():
                 chunks.append({
                     "text": chunk.strip(),
                     "source": source
@@ -140,29 +213,40 @@ class SimpleRAG:
         return dot_product / (magnitude1 * magnitude2)
 
     def index_documents(self, docs_path: Path) -> int:
-        """Index all documents in the given folder."""
+        """Index all supported documents in the given folder."""
         if not docs_path.exists():
             docs_path.mkdir(parents=True)
             print(f"\n[+] Created '{docs_path}' folder. Add your documents there!")
             return 0
 
-        # Supported file types
-        extensions = [".txt", ".md", ".py", ".js", ".java", ".cpp", ".c", ".html", ".css"]
-        files = [f for f in docs_path.rglob("*") if f.suffix.lower() in extensions]
+        # All supported file types
+        supported = TEXT_EXTENSIONS | PDF_EXTENSIONS
+        files = [f for f in docs_path.rglob("*") if f.suffix.lower() in supported]
 
         if not files:
             print(f"\n[!] No documents found in '{docs_path}'")
-            print(f"    Supported types: {', '.join(extensions)}")
+            print(f"    Supported types: {', '.join(sorted(supported))}")
             return 0
+
+        # Warn once up front if PDFs are present but pypdf isn't
+        pdfs_present = any(f.suffix.lower() in PDF_EXTENSIONS for f in files)
+        if pdfs_present and not PDF_SUPPORT:
+            print("\n[!] PDF files found but 'pypdf' is not installed.")
+            print("    Install it with: pip install pypdf")
+            print("    Continuing without PDF support...")
 
         print(f"\n[*] Indexing {len(files)} document(s)...")
         self.documents = []
 
         for file_path in files:
             try:
-                content = file_path.read_text(encoding="utf-8", errors="ignore")
-                chunks = self.chunk_text(content, str(file_path))
+                content = read_document(file_path)
+                if not content.strip():
+                    print(f"    [SKIP] {file_path.name} (no extractable text)")
+                    continue
 
+                chunks = self.chunk_text(content, str(file_path))
+                indexed_chunks = 0
                 for chunk in chunks:
                     embedding = self.get_embedding(chunk["text"])
                     if embedding:
@@ -171,7 +255,9 @@ class SimpleRAG:
                             "source": chunk["source"],
                             "embedding": embedding
                         })
-                print(f"    [OK] {file_path.name} ({len(chunks)} chunks)")
+                        indexed_chunks += 1
+                tag = "PDF" if file_path.suffix.lower() in PDF_EXTENSIONS else "OK"
+                print(f"    [{tag}] {file_path.name} ({indexed_chunks} chunks)")
             except Exception as e:
                 print(f"    [!] Error reading {file_path.name}: {e}")
 
@@ -187,7 +273,6 @@ class SimpleRAG:
         if not query_embedding:
             return []
 
-        # Calculate similarities
         results = []
         for doc in self.documents:
             similarity = self.cosine_similarity(query_embedding, doc["embedding"])
@@ -197,7 +282,6 @@ class SimpleRAG:
                 "similarity": similarity
             })
 
-        # Sort by similarity and return top_k
         results.sort(key=lambda x: x["similarity"], reverse=True)
         return results[:top_k]
 
@@ -250,18 +334,15 @@ class CodeTutor:
 
     def send_message(self, user_message: str, use_rag: bool = True) -> str:
         """Send a message with optional RAG context."""
-        # Get RAG context if available
         context = ""
         if use_rag and self.rag.is_indexed:
             context = self.rag.get_context(user_message)
 
-        # Build the full message
         if context:
             full_message = f"{context}\n\n## Student's Question:\n{user_message}"
         else:
             full_message = user_message
 
-        # Add to history
         self.conversation_history.append({
             "role": "user",
             "content": full_message
@@ -274,16 +355,12 @@ class CodeTutor:
                 temperature=0.7,
                 max_tokens=1000
             )
-
             assistant_message = response.choices[0].message.content
-
             self.conversation_history.append({
                 "role": "assistant",
                 "content": assistant_message
             })
-
             return assistant_message
-
         except Exception as e:
             error_msg = f"API Error: {str(e)}"
             self.conversation_history.pop()
@@ -341,7 +418,6 @@ class CodeTutor:
         """Allow user to paste multi-line code."""
         print("\nPaste your code below (type END on a new line when done):")
         print("-" * 50)
-
         lines = []
         while True:
             try:
@@ -351,7 +427,6 @@ class CodeTutor:
                 lines.append(line)
             except EOFError:
                 break
-
         self.current_code = "\n".join(lines)
         self.save_code(self.current_code)
         print("[OK] Code saved!")
@@ -379,7 +454,7 @@ class CodeTutor:
             print("    The tutor will now reference these when answering.")
         else:
             print(f"\n[!] No documents indexed.")
-            print(f"    Add .txt, .md, .py files to the '{DOCS_FOLDER}' folder.")
+            print(f"    Add .txt, .md, .py, or .pdf files to the '{DOCS_FOLDER}' folder.")
 
     def search_docs(self, query: str):
         """Search indexed documents."""
@@ -403,39 +478,42 @@ class CodeTutor:
     def print_help(self):
         """Display help information."""
         rag_status = "ON" if self.rag.is_indexed else "OFF"
+        pdf_status = "ON" if PDF_SUPPORT else "OFF (pip install pypdf)"
         help_text = f"""
 +------------------------------------------------------------------+
-|               AI Code Tutor with RAG - Commands                   |
+|              AI Code Tutor with RAG - Commands                   |
 +------------------------------------------------------------------+
-|  CHAT COMMANDS:                                                   |
-|    /paste    - Paste a multi-line code snippet                    |
-|    /show     - Display your current code                          |
-|    /edit     - Open code in external editor                       |
-|    /share    - Share current code with the tutor                  |
-|    /clear    - Clear conversation history                         |
+| CHAT COMMANDS:                                                   |
+|   /paste     - Paste a multi-line code snippet                   |
+|   /show      - Display your current code                         |
+|   /edit      - Open code in external editor                      |
+|   /share     - Share current code with the tutor                 |
+|   /clear     - Clear conversation history                        |
 +------------------------------------------------------------------+
-|  RAG COMMANDS (Reference Your Own Documents):                     |
-|    /index    - Index documents in the 'docs/' folder              |
-|    /search   - Search indexed documents (e.g., /search loops)     |
-|    /rag      - Toggle RAG on/off                                  |
+| RAG COMMANDS (Reference Your Own Documents):                     |
+|   /index     - Index documents in the 'docs/' folder             |
+|   /search    - Search indexed documents (e.g., /search loops)    |
+|   /rag       - Toggle RAG on/off                                 |
 +------------------------------------------------------------------+
-|  OTHER:                                                           |
-|    /help     - Show this help message                             |
-|    /quit     - Exit the tutor                                     |
+| OTHER:                                                           |
+|   /help      - Show this help message                            |
+|   /quit      - Exit the tutor                                    |
 +------------------------------------------------------------------+
-|  RAG Status: {rag_status:4}                                                |
-|  Put .txt, .md, .py files in 'docs/' folder, then run /index      |
+| RAG Status: {rag_status:4}    PDF Support: {pdf_status:25}       |
+| Put .txt, .md, .py, or .pdf files in 'docs/', then run /index    |
 +------------------------------------------------------------------+
-"""
+        """
         print(help_text)
 
     def run(self):
         """Main conversation loop."""
         print("\n" + "=" * 60)
-        print("  AI CODE TUTOR with RAG")
+        print("           AI CODE TUTOR with RAG")
         print("=" * 60)
         print("I'll help you learn through guided discovery.")
         print("Put your reference docs in 'docs/' and run /index")
+        if not PDF_SUPPORT:
+            print("[Tip] Install 'pypdf' to enable PDF document support.")
         print("\nType /help for commands, or just start chatting!")
         print("=" * 60)
 

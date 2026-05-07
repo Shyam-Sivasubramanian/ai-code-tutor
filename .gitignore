@@ -24,3 +24,5 @@ Thumbs.db
 # Temp files
 *.tmp
 tutor_code.py
+
+docs/
